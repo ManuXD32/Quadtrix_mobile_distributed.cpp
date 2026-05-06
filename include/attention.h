@@ -62,17 +62,17 @@ struct Head
             return key.num_params() + query.num_params() + value.num_params();
       }
 
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
-            key.save(f);
-            query.save(f);
-            value.save(f);
+            key.save(f, v2);
+            query.save(f, v2);
+            value.save(f, v2);
       }
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
-            key.load(f);
-            query.load(f);
-            value.load(f);
+            key.load(f, v2);
+            query.load(f, v2);
+            value.load(f, v2);
       }
 
 private:
@@ -122,16 +122,16 @@ struct MultiHeadAttention
             return n;
       }
 
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
             for (auto &h : heads)
-                  h.save(f);
-            proj.save(f);
+                  h.save(f, v2);
+            proj.save(f, v2);
       }
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
             for (auto &h : heads)
-                  h.load(f);
-            proj.load(f);
+                  h.load(f, v2);
+            proj.load(f, v2);
       }
 };

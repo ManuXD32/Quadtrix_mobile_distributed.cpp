@@ -18,16 +18,16 @@ static const unsigned int SEED = 1337;
 static const double TRAIN_SPLIT = 0.9; // 90 % train, 10 % val
 
 // ── Hyper-parameters (identical to the Python script) ───────
-static const int BATCH_SIZE = 4;
-static const int BLOCK_SIZE = 64; // context length
-static const int MAX_ITERS = 3000;
-static const int EVAL_INTERVAL = 200;
-static const float LEARNING_RATE = 3e-4f;
-static const int EVAL_ITERS = 10;
-static const int N_EMBD = 128;
-static const int N_HEAD = 4;
-static const int N_LAYER = 4;
-static const float DROPOUT = 0.2f; // applied during training only
+static const int BATCH_SIZE = 8;
+static const int BLOCK_SIZE = 256; // context length
+static const int MAX_ITERS = 20000;
+static const int EVAL_INTERVAL = 100;
+static const float LEARNING_RATE = 2e-4f;
+static const int EVAL_ITERS = 5;
+static const int N_EMBD = 384;
+static const int N_HEAD = 6;
+static const int N_LAYER = 16;
+static const float DROPOUT = 0.1f; // applied during training only
 
 // ── Output paths ─────────────────────────────────────────────
 static const std::string BEST_MODEL_PATH = "best_model.bin";

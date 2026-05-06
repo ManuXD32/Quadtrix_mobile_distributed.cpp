@@ -44,18 +44,18 @@ struct Block
             return sa.num_params() + ffwd.num_params() + ln1.num_params() + ln2.num_params();
       }
 
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
-            sa.save(f);
-            ffwd.save(f);
-            ln1.save(f);
-            ln2.save(f);
+            sa.save(f, v2);
+            ffwd.save(f, v2);
+            ln1.save(f, v2);
+            ln2.save(f, v2);
       }
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
-            sa.load(f);
-            ffwd.load(f);
-            ln1.load(f);
-            ln2.load(f);
+            sa.load(f, v2);
+            ffwd.load(f, v2);
+            ln1.load(f, v2);
+            ln2.load(f, v2);
       }
 };

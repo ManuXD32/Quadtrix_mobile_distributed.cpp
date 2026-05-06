@@ -35,14 +35,14 @@ struct FeedForward
             return fc1.num_params() + fc2.num_params();
       }
 
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
-            fc1.save(f);
-            fc2.save(f);
+            fc1.save(f, v2);
+            fc2.save(f, v2);
       }
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
-            fc1.load(f);
-            fc2.load(f);
+            fc1.load(f, v2);
+            fc2.load(f, v2);
       }
 };

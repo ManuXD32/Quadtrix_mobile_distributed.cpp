@@ -13,8 +13,12 @@
 #include <vector>
 #include <fstream>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <sstream>
 #include <random>
+#include <stdexcept>
 
 // ------------------------------------------------------------------
 // Cross-entropy loss for language modelling
@@ -125,6 +129,101 @@ struct GPTLanguageModel
             return n;
       }
 
+      bool has_quantized_parameters() const
+      {
+            if (token_emb.weight.quantized || pos_emb.weight.quantized ||
+                ln_f.gamma.quantized || ln_f.beta.quantized ||
+                lm_head.weight.quantized || lm_head.bias.quantized)
+                  return true;
+            for (const auto &blk : blocks)
+            {
+                  for (const auto &h : blk.sa.heads)
+                  {
+                        if (h.key.weight.quantized || h.query.weight.quantized || h.value.weight.quantized)
+                              return true;
+                  }
+                  if (blk.sa.proj.weight.quantized || blk.sa.proj.bias.quantized ||
+                      blk.ffwd.fc1.weight.quantized || blk.ffwd.fc1.bias.quantized ||
+                      blk.ffwd.fc2.weight.quantized || blk.ffwd.fc2.bias.quantized ||
+                      blk.ln1.gamma.quantized || blk.ln1.beta.quantized ||
+                      blk.ln2.gamma.quantized || blk.ln2.beta.quantized)
+                        return true;
+            }
+            return false;
+      }
+
+      int quantized_parameter_bits() const
+      {
+            int bits = 0;
+            auto observe = [&](const Tensor &t) {
+                  if (!t.quantized) return;
+                  if (bits == 0) bits = t.quant_bits;
+                  else if (bits != t.quant_bits) bits = -1;
+            };
+
+            observe(token_emb.weight);
+            observe(pos_emb.weight);
+            observe(ln_f.gamma);
+            observe(ln_f.beta);
+            observe(lm_head.weight);
+            observe(lm_head.bias);
+            for (const auto &blk : blocks)
+            {
+                  for (const auto &h : blk.sa.heads)
+                  {
+                        observe(h.key.weight);
+                        observe(h.query.weight);
+                        observe(h.value.weight);
+                  }
+                  observe(blk.sa.proj.weight);
+                  observe(blk.sa.proj.bias);
+                  observe(blk.ffwd.fc1.weight);
+                  observe(blk.ffwd.fc1.bias);
+                  observe(blk.ffwd.fc2.weight);
+                  observe(blk.ffwd.fc2.bias);
+                  observe(blk.ln1.gamma);
+                  observe(blk.ln1.beta);
+                  observe(blk.ln2.gamma);
+                  observe(blk.ln2.beta);
+            }
+            return bits;
+      }
+
+      void quantize_parameters(int bits)
+      {
+            if (bits != 4 && bits != 8)
+                  throw std::runtime_error("[QUANT] Strict quantized weights require int8 or int4."
+                                           "\n[ES] Los pesos cuantizados estrictos requieren int8 o int4.");
+
+            token_emb.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerRow);
+            pos_emb.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerRow);
+
+            for (auto &blk : blocks)
+            {
+                  for (auto &h : blk.sa.heads)
+                  {
+                        h.key.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+                        h.query.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+                        h.value.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+                  }
+                  blk.sa.proj.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+                  blk.sa.proj.bias.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+                  blk.ffwd.fc1.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+                  blk.ffwd.fc1.bias.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+                  blk.ffwd.fc2.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+                  blk.ffwd.fc2.bias.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+                  blk.ln1.gamma.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+                  blk.ln1.beta.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+                  blk.ln2.gamma.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+                  blk.ln2.beta.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+            }
+
+            ln_f.gamma.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+            ln_f.beta.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+            lm_head.weight.quantize_inplace(bits, Tensor::ScaleLayout::PerCol);
+            lm_head.bias.quantize_inplace(bits, Tensor::ScaleLayout::PerTensor);
+      }
+
       // ----------------------------------------------------------------
       // forward
       //   idx    : flat [B*T] token indices
@@ -225,7 +324,92 @@ struct GPTLanguageModel
       // ----------------------------------------------------------------
       // save / load weights
       // ----------------------------------------------------------------
-      void save(const std::string &path) const
+      void save_stream(std::ostream &f, const std::string &optimizer_name = "adamw") const
+      {
+            const char magic[8] = {'Q','T','R','X','C','K','P','T'};
+            bool v2 = has_quantized_parameters();
+            uint32_t version = v2 ? 2u : 1u;
+            uint32_t fields[6] = {
+                  version,
+                  (uint32_t)vocab_size,
+                  (uint32_t)n_embd,
+                  (uint32_t)n_head,
+                  (uint32_t)n_layer,
+                  (uint32_t)block_size
+            };
+            uint32_t opt_len = (uint32_t)optimizer_name.size();
+            f.write(magic, sizeof(magic));
+            f.write(reinterpret_cast<const char *>(fields), sizeof(fields));
+            f.write(reinterpret_cast<const char *>(&opt_len), sizeof(opt_len));
+            if (opt_len > 0)
+                  f.write(optimizer_name.data(), opt_len);
+            token_emb.save(f, v2);
+            pos_emb.save(f, v2);
+            for (auto &b : blocks)
+                  b.save(f, v2);
+            ln_f.save(f, v2);
+            lm_head.save(f, v2);
+      }
+
+      void load_stream(std::istream &f)
+      {
+            char magic[8] = {0};
+            f.read(magic, sizeof(magic));
+            const char expected[8] = {'Q','T','R','X','C','K','P','T'};
+            if (f.gcount() == (std::streamsize)sizeof(magic) &&
+                std::memcmp(magic, expected, sizeof(magic)) == 0)
+            {
+                  uint32_t fields[6] = {0};
+                  uint32_t opt_len = 0;
+                  f.read(reinterpret_cast<char *>(fields), sizeof(fields));
+                  f.read(reinterpret_cast<char *>(&opt_len), sizeof(opt_len));
+                  if (!f)
+                        throw std::runtime_error("[LOAD] Invalid checkpoint header.\n[ES] Cabecera de checkpoint no valida.");
+                  bool v2 = fields[0] == 2;
+                  if ((fields[0] != 1 && fields[0] != 2) ||
+                      fields[1] != (uint32_t)vocab_size ||
+                      fields[2] != (uint32_t)n_embd ||
+                      fields[3] != (uint32_t)n_head ||
+                      fields[4] != (uint32_t)n_layer ||
+                      fields[5] != (uint32_t)block_size)
+                  {
+                        throw std::runtime_error("[LOAD] Checkpoint is incompatible with this dataset/model shape."
+                                                 "\n[ES] El checkpoint no es compatible con este dataset o forma del modelo.");
+                  }
+                  if (opt_len > 0)
+                        f.seekg((std::streamoff)opt_len, std::ios::cur);
+                  token_emb.load(f, v2);
+                  pos_emb.load(f, v2);
+                  for (auto &b : blocks)
+                        b.load(f, v2);
+                  ln_f.load(f, v2);
+                  lm_head.load(f, v2);
+                  return;
+            }
+            f.clear();
+            f.seekg(0, std::ios::beg);
+            token_emb.load(f, false);
+            pos_emb.load(f, false);
+            for (auto &b : blocks)
+                  b.load(f, false);
+            ln_f.load(f, false);
+            lm_head.load(f, false);
+      }
+
+      std::string save_bytes(const std::string &optimizer_name = "adamw") const
+      {
+            std::ostringstream ss(std::ios::binary);
+            save_stream(ss, optimizer_name);
+            return ss.str();
+      }
+
+      void load_bytes(const std::string &bytes)
+      {
+            std::istringstream ss(bytes, std::ios::binary);
+            load_stream(ss);
+      }
+
+      void save(const std::string &path, const std::string &optimizer_name = "adamw") const
       {
             std::ofstream f(path, std::ios::binary);
             if (!f)
@@ -233,12 +417,7 @@ struct GPTLanguageModel
                   std::cerr << "[ERROR] Cannot open " << path << " for writing\n";
                   return;
             }
-            token_emb.save(f);
-            pos_emb.save(f);
-            for (auto &b : blocks)
-                  b.save(f);
-            ln_f.save(f);
-            lm_head.save(f);
+            save_stream(f, optimizer_name);
             std::cout << "[SAVE]  Weights written to " << path << "\n";
       }
 
@@ -250,12 +429,7 @@ struct GPTLanguageModel
                   std::cerr << "[ERROR] Cannot open " << path << " for reading\n";
                   return;
             }
-            token_emb.load(f);
-            pos_emb.load(f);
-            for (auto &b : blocks)
-                  b.load(f);
-            ln_f.load(f);
-            lm_head.load(f);
+            load_stream(f);
             std::cout << "[LOAD]  Weights loaded from " << path << "\n";
       }
 };

@@ -49,14 +49,14 @@ struct Embedding
 
       int num_params() const { return weight.numel(); }
 
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
-            f.write(reinterpret_cast<const char *>(weight.data.data()),
-                    weight.numel() * sizeof(float));
+            if (v2) weight.save_v2(f);
+            else weight.save_raw_float(f);
       }
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
-            f.read(reinterpret_cast<char *>(weight.data.data()),
-                   weight.numel() * sizeof(float));
+            if (v2) weight.load_v2(f);
+            else weight.load_raw_float(f);
       }
 };

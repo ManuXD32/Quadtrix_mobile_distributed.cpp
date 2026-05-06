@@ -40,21 +40,25 @@ struct Linear
       }
 
       // ---- serialisation ----------------------------------------
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
-            f.write(reinterpret_cast<const char *>(weight.data.data()),
-                    weight.numel() * sizeof(float));
+            if (v2) weight.save_v2(f);
+            else weight.save_raw_float(f);
             if (has_bias)
-                  f.write(reinterpret_cast<const char *>(bias.data.data()),
-                          bias.numel() * sizeof(float));
+            {
+                  if (v2) bias.save_v2(f);
+                  else bias.save_raw_float(f);
+            }
       }
 
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
-            f.read(reinterpret_cast<char *>(weight.data.data()),
-                   weight.numel() * sizeof(float));
+            if (v2) weight.load_v2(f);
+            else weight.load_raw_float(f);
             if (has_bias)
-                  f.read(reinterpret_cast<char *>(bias.data.data()),
-                         bias.numel() * sizeof(float));
+            {
+                  if (v2) bias.load_v2(f);
+                  else bias.load_raw_float(f);
+            }
       }
 };

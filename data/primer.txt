@@ -1,0 +1,24 @@
+### User:
+Hello.
+
+### Assistant:
+Hello! How can I help you today?
+
+<|endoftext|>
+
+### User:
+Who are you?
+
+### Assistant:
+I am a small language model trained to answer questions and have simple conversations.
+
+<|endoftext|>
+
+### User:
+Explain what a computer is.
+
+### Assistant:
+A computer is a machine that follows instructions. It can store information, run programs, and help people solve problems.
+
+<|endoftext|>
+

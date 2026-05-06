@@ -19,6 +19,12 @@
 #include <vector>
 #include <cmath>
 #include <cassert>
+#include <cstdint>
+#include <functional>
+#include <cstring>
+#include <sstream>
+#include <string>
+#include <utility>
 
 // =============================================================
 // Gradient stores (one per learnable weight tensor)
@@ -165,6 +171,307 @@ struct Grads
       }
 };
 
+inline void for_each_grad_tensor(Grads &g, const std::function<void(Tensor &)> &fn)
+{
+      fn(g.tok_emb.dW);
+      fn(g.pos_emb.dW);
+      for (auto &gb : g.blocks)
+      {
+            for (auto &h : gb.sa.heads)
+            {
+                  fn(h.dkey.dW);
+                  fn(h.dquery.dW);
+                  fn(h.dvalue.dW);
+            }
+            fn(gb.sa.proj.dW);
+            if (gb.sa.proj.has_bias) fn(gb.sa.proj.db);
+            fn(gb.ffwd.dfc1.dW);
+            if (gb.ffwd.dfc1.has_bias) fn(gb.ffwd.dfc1.db);
+            fn(gb.ffwd.dfc2.dW);
+            if (gb.ffwd.dfc2.has_bias) fn(gb.ffwd.dfc2.db);
+            fn(gb.ln1.dgamma);
+            fn(gb.ln1.dbeta);
+            fn(gb.ln2.dgamma);
+            fn(gb.ln2.dbeta);
+      }
+      fn(g.ln_f.dgamma);
+      fn(g.ln_f.dbeta);
+      fn(g.lm_head.dW);
+      if (g.lm_head.has_bias) fn(g.lm_head.db);
+}
+
+inline void for_each_grad_tensor_const(const Grads &g, const std::function<void(const Tensor &)> &fn)
+{
+      fn(g.tok_emb.dW);
+      fn(g.pos_emb.dW);
+      for (const auto &gb : g.blocks)
+      {
+            for (const auto &h : gb.sa.heads)
+            {
+                  fn(h.dkey.dW);
+                  fn(h.dquery.dW);
+                  fn(h.dvalue.dW);
+            }
+            fn(gb.sa.proj.dW);
+            if (gb.sa.proj.has_bias) fn(gb.sa.proj.db);
+            fn(gb.ffwd.dfc1.dW);
+            if (gb.ffwd.dfc1.has_bias) fn(gb.ffwd.dfc1.db);
+            fn(gb.ffwd.dfc2.dW);
+            if (gb.ffwd.dfc2.has_bias) fn(gb.ffwd.dfc2.db);
+            fn(gb.ln1.dgamma);
+            fn(gb.ln1.dbeta);
+            fn(gb.ln2.dgamma);
+            fn(gb.ln2.dbeta);
+      }
+      fn(g.ln_f.dgamma);
+      fn(g.ln_f.dbeta);
+      fn(g.lm_head.dW);
+      if (g.lm_head.has_bias) fn(g.lm_head.db);
+}
+
+inline void add_grads_inplace(Grads &dst, const Grads &src)
+{
+      std::vector<const Tensor *> tensors;
+      tensors.reserve(128);
+      for_each_grad_tensor_const(src, [&](const Tensor &t) {
+            tensors.push_back(&t);
+      });
+
+      size_t idx = 0;
+      for_each_grad_tensor(dst, [&](Tensor &t) {
+            if (idx >= tensors.size() || t.numel() != tensors[idx]->numel())
+                  throw std::runtime_error("[DIST] Gradient tensor shape mismatch while adding worker result."
+                                           "\n[ES] Forma de gradiente incompatible al sumar resultado del worker.");
+            const Tensor &s = *tensors[idx++];
+            for (int i = 0; i < t.numel(); ++i)
+                  t.data[(size_t)i] += s.data[(size_t)i];
+      });
+}
+
+inline void scale_grads_inplace(Grads &g, float scale)
+{
+      for_each_grad_tensor(g, [&](Tensor &t) {
+            for (float &v : t.data)
+                  v *= scale;
+      });
+}
+
+namespace quadtrix_grad_wire
+{
+inline void append_bytes(std::string &out, const void *data, size_t n)
+{
+      out.append(reinterpret_cast<const char *>(data), n);
+}
+
+template <typename T>
+inline void append_pod(std::string &out, const T &v)
+{
+      append_bytes(out, &v, sizeof(T));
+}
+
+template <typename T>
+inline T read_pod(const std::string &src, size_t &pos)
+{
+      if (pos + sizeof(T) > src.size())
+            throw std::runtime_error("[DIST] Truncated gradient payload.\n[ES] Payload de gradientes truncado.");
+      T v;
+      std::memcpy(&v, src.data() + pos, sizeof(T));
+      pos += sizeof(T);
+      return v;
+}
+
+inline int qmax_for_bits(int bits)
+{
+      if (bits == 4) return 7;
+      if (bits == 8) return 127;
+      if (bits == 16) return 32767;
+      return 0;
+}
+
+inline uint8_t encode_i4_grad(int q)
+{
+      if (q > 7) q = 7;
+      if (q < -7) q = -7;
+      if (q < 0) q += 16;
+      return (uint8_t)(q & 0x0f);
+}
+
+inline int decode_i4_grad(uint8_t nibble)
+{
+      int q = (int)(nibble & 0x0f);
+      return q >= 8 ? q - 16 : q;
+}
+} // namespace quadtrix_grad_wire
+
+inline std::string serialize_grads(const Grads &g, int bits)
+{
+      using namespace quadtrix_grad_wire;
+      if (bits != 32 && bits != 16 && bits != 8 && bits != 4)
+            bits = 32;
+
+      uint32_t tensor_count = 0;
+      for_each_grad_tensor_const(g, [&](const Tensor &) {
+            ++tensor_count;
+      });
+
+      std::string out;
+      out.reserve(1024);
+      const uint32_t magic = 0x44524751u; // QGRD on little-endian payloads
+      const uint32_t version = 1;
+      append_pod(out, magic);
+      append_pod(out, version);
+      append_pod(out, (uint32_t)bits);
+      append_pod(out, tensor_count);
+
+      for_each_grad_tensor_const(g, [&](const Tensor &t) {
+            uint32_t n = (uint32_t)t.numel();
+            append_pod(out, n);
+            if (bits == 32)
+            {
+                  append_bytes(out, t.data.data(), (size_t)n * sizeof(float));
+                  return;
+            }
+
+            float max_abs = 0.0f;
+            for (float v : t.data)
+                  max_abs = std::max(max_abs, std::fabs(v));
+            int qmax = qmax_for_bits(bits);
+            float scale = max_abs > 0.0f ? max_abs / (float)qmax : 1.0f;
+            append_pod(out, scale);
+
+            if (bits == 16)
+            {
+                  for (uint32_t i = 0; i < n; ++i)
+                  {
+                        int q = scale > 0.0f ? (int)std::lrint(t.data[i] / scale) : 0;
+                        if (q > qmax) q = qmax;
+                        if (q < -qmax) q = -qmax;
+                        int16_t v = (int16_t)q;
+                        append_pod(out, v);
+                  }
+            }
+            else if (bits == 8)
+            {
+                  for (uint32_t i = 0; i < n; ++i)
+                  {
+                        int q = scale > 0.0f ? (int)std::lrint(t.data[i] / scale) : 0;
+                        if (q > qmax) q = qmax;
+                        if (q < -qmax) q = -qmax;
+                        int8_t v = (int8_t)q;
+                        append_pod(out, v);
+                  }
+            }
+            else
+            {
+                  size_t packed = ((size_t)n + 1) / 2;
+                  std::vector<uint8_t> bytes(packed, 0);
+                  for (uint32_t i = 0; i < n; ++i)
+                  {
+                        int q = scale > 0.0f ? (int)std::lrint(t.data[i] / scale) : 0;
+                        uint8_t enc = encode_i4_grad(q);
+                        if (i % 2 == 0)
+                              bytes[i / 2] = (uint8_t)((bytes[i / 2] & 0xf0) | enc);
+                        else
+                              bytes[i / 2] = (uint8_t)((bytes[i / 2] & 0x0f) | (enc << 4));
+                  }
+                  append_bytes(out, bytes.data(), bytes.size());
+            }
+      });
+      return out;
+}
+
+inline void deserialize_grads_into(Grads &g, const std::string &payload)
+{
+      using namespace quadtrix_grad_wire;
+      size_t pos = 0;
+      uint32_t magic = read_pod<uint32_t>(payload, pos);
+      uint32_t version = read_pod<uint32_t>(payload, pos);
+      uint32_t bits = read_pod<uint32_t>(payload, pos);
+      uint32_t tensor_count = read_pod<uint32_t>(payload, pos);
+      if (magic != 0x44524751u || version != 1 ||
+          (bits != 32 && bits != 16 && bits != 8 && bits != 4))
+            throw std::runtime_error("[DIST] Unsupported gradient payload format."
+                                     "\n[ES] Formato de payload de gradientes no soportado.");
+
+      uint32_t seen = 0;
+      for_each_grad_tensor(g, [&](Tensor &t) {
+            uint32_t n = read_pod<uint32_t>(payload, pos);
+            if (n != (uint32_t)t.numel())
+                  throw std::runtime_error("[DIST] Worker gradient shape does not match coordinator model."
+                                           "\n[ES] La forma de gradiente del worker no coincide con el modelo coordinador.");
+            if (bits == 32)
+            {
+                  size_t bytes = (size_t)n * sizeof(float);
+                  if (pos + bytes > payload.size())
+                        throw std::runtime_error("[DIST] Truncated float gradient tensor."
+                                                 "\n[ES] Tensor de gradiente float truncado.");
+                  std::memcpy(t.data.data(), payload.data() + pos, bytes);
+                  pos += bytes;
+            }
+            else
+            {
+                  float scale = read_pod<float>(payload, pos);
+                  if (bits == 16)
+                  {
+                        for (uint32_t i = 0; i < n; ++i)
+                        {
+                              int16_t q = read_pod<int16_t>(payload, pos);
+                              t.data[i] = (float)q * scale;
+                        }
+                  }
+                  else if (bits == 8)
+                  {
+                        for (uint32_t i = 0; i < n; ++i)
+                        {
+                              int8_t q = read_pod<int8_t>(payload, pos);
+                              t.data[i] = (float)q * scale;
+                        }
+                  }
+                  else
+                  {
+                        size_t packed = ((size_t)n + 1) / 2;
+                        if (pos + packed > payload.size())
+                              throw std::runtime_error("[DIST] Truncated int4 gradient tensor."
+                                                       "\n[ES] Tensor de gradiente int4 truncado.");
+                        for (uint32_t i = 0; i < n; ++i)
+                        {
+                              uint8_t byte = (uint8_t)payload[pos + i / 2];
+                              uint8_t nibble = (i % 2 == 0) ? (byte & 0x0f) : ((byte >> 4) & 0x0f);
+                              t.data[i] = (float)decode_i4_grad(nibble) * scale;
+                        }
+                        pos += packed;
+                  }
+            }
+            ++seen;
+      });
+
+      if (seen != tensor_count)
+            throw std::runtime_error("[DIST] Gradient tensor count mismatch."
+                                     "\n[ES] Cantidad de tensores de gradiente incompatible.");
+}
+
+inline float clip_grads_global_norm(Grads &g, float max_norm)
+{
+      if (max_norm <= 0.0f) return 0.0f;
+
+      double sum_sq = 0.0;
+      for_each_grad_tensor(g, [&](Tensor &t) {
+            for (float v : t.data)
+                  sum_sq += (double)v * (double)v;
+      });
+
+      float norm = (float)std::sqrt(sum_sq);
+      if (norm > max_norm && norm > 0.0f)
+      {
+            float scale = max_norm / (norm + 1e-6f);
+            for_each_grad_tensor(g, [&](Tensor &t) {
+                  for (float &v : t.data)
+                        v *= scale;
+            });
+      }
+      return norm;
+}
+
 // ============================================================
 // Saved activations from the forward pass
 // (we need these to compute gradients)
@@ -284,29 +591,72 @@ inline Tensor backward_linear(const Tensor &dOut, // [B, T, E]
 
       // dX = dOut @ W^T   [B, T, D]
       Tensor dX({B, T, D}, 0.0f);
-      for (int b = 0; b < B; ++b)
-            for (int t = 0; t < T; ++t)
-                  for (int d = 0; d < D; ++d)
-                  {
-                        float s = 0.0f;
-                        for (int e = 0; e < E; ++e)
-                              s += dOut.at(b, t, e) * W.at(d, e);
-                        dX.at(b, t, d) += s;
-                  }
+      int qbits = quadtrix_compute_quant_bits();
+      if (qbits == 4 || qbits == 8)
+      {
+            Tensor wt({E, D}, 0.0f);
+            for (int d = 0; d < D; ++d)
+                  for (int e = 0; e < E; ++e)
+                        wt.at(e, d) = W.at(d, e);
+            dX = matmul_quantized_2d(dOut.data.data(), B * T, E, E,
+                                     wt.data.data(), D, D,
+                                     {B, T, D}, qbits);
+      }
+      else
+      {
+#pragma omp parallel for collapse(2) if(B * T * D > 4096)
+            for (int b = 0; b < B; ++b)
+                  for (int t = 0; t < T; ++t)
+                        for (int d = 0; d < D; ++d)
+                        {
+                              float s = 0.0f;
+                              for (int e = 0; e < E; ++e)
+                                    s += dOut.at(b, t, e) * W.at(d, e);
+                              dX.at(b, t, d) += s;
+                        }
+      }
 
       // dW += x^T @ dOut  accumulated [D, E]
-      for (int b = 0; b < B; ++b)
-            for (int t = 0; t < T; ++t)
-                  for (int d = 0; d < D; ++d)
-                        for (int e = 0; e < E; ++e)
-                              g.dW.at(d, e) += x.at(b, t, d) * dOut.at(b, t, e);
+      if (qbits == 4 || qbits == 8)
+      {
+            Tensor xt({D, B * T}, 0.0f);
+            for (int b = 0; b < B; ++b)
+                  for (int t = 0; t < T; ++t)
+                        for (int d = 0; d < D; ++d)
+                              xt.at(d, b * T + t) = x.at(b, t, d);
+            Tensor dWq = matmul_quantized_2d(xt.data.data(), D, B * T, B * T,
+                                             dOut.data.data(), E, E,
+                                             {D, E}, qbits);
+            for (int i = 0; i < g.dW.numel(); ++i)
+                  g.dW.data[i] += dWq.data[i];
+      }
+      else
+      {
+#pragma omp parallel for collapse(2) if(D * E > 4096)
+            for (int d = 0; d < D; ++d)
+                  for (int e = 0; e < E; ++e)
+                  {
+                        float s = 0.0f;
+                        for (int b = 0; b < B; ++b)
+                              for (int t = 0; t < T; ++t)
+                                    s += x.at(b, t, d) * dOut.at(b, t, e);
+                        g.dW.at(d, e) += s;
+                  }
+      }
 
       // db += sum over B, T
       if (g.has_bias)
-            for (int b = 0; b < B; ++b)
-                  for (int t = 0; t < T; ++t)
-                        for (int e = 0; e < E; ++e)
-                              g.db.at(e) += dOut.at(b, t, e);
+      {
+#pragma omp parallel for if(E > 128)
+            for (int e = 0; e < E; ++e)
+            {
+                  float s = 0.0f;
+                  for (int b = 0; b < B; ++b)
+                        for (int t = 0; t < T; ++t)
+                              s += dOut.at(b, t, e);
+                  g.db.at(e) += s;
+            }
+      }
 
       return dX;
 }
@@ -639,7 +989,8 @@ inline SavedForward forward_save(GPTLanguageModel &model,
                                  const std::vector<int> &idx,
                                  int B, int T,
                                  const std::vector<int> &targets,
-                                 bool training)
+                                 bool training,
+                                 float drop_p = DROPOUT)
 {
       SavedForward s;
       s.idx = idx;
@@ -685,7 +1036,7 @@ inline SavedForward forward_save(GPTLanguageModel &model,
                                            Wks, Wqs, Wvs,
                                            blk.sa.proj.weight,
                                            blk.sa.proj.bias,
-                                           n_head, training, DROPOUT,
+                                           n_head, training, drop_p,
                                            model.rng, sb.mha);
             sb.x_after_mha = add(x, attn); // residual
 
@@ -695,7 +1046,7 @@ inline SavedForward forward_save(GPTLanguageModel &model,
             Tensor ffn = forward_ffn_save(x_ln2,
                                           blk.ffwd.fc1.weight, blk.ffwd.fc1.bias,
                                           blk.ffwd.fc2.weight, blk.ffwd.fc2.bias,
-                                          training, DROPOUT, model.rng, sb.ffn);
+                                          training, drop_p, model.rng, sb.ffn);
             x = add(sb.x_after_mha, ffn);
       }
 
@@ -717,7 +1068,7 @@ inline SavedForward forward_save(GPTLanguageModel &model,
 // Full backward pass
 // ============================================================
 
-inline Grads backward(GPTLanguageModel &model, const SavedForward &s)
+inline Grads backward(GPTLanguageModel &model, const SavedForward &s, float drop_p = DROPOUT)
 {
       int B = s.B, T = s.T;
       int C = model.n_embd, V = model.vocab_size;
@@ -759,7 +1110,7 @@ inline Grads backward(GPTLanguageModel &model, const SavedForward &s)
             // dffn_out → (dropout bwd) → fc2 bwd → relu bwd → fc1 bwd → dx_ln2
             Tensor dffn = dffn_out;
             if (sb.ffn.used_dropout)
-                  dffn = backward_dropout(dffn, sb.ffn.dropout_mask, DROPOUT);
+                  dffn = backward_dropout(dffn, sb.ffn.dropout_mask, drop_p);
 
             // fc2 backward
             Tensor dh_relu = backward_linear(dffn, sb.ffn.h,
@@ -783,7 +1134,7 @@ inline Grads backward(GPTLanguageModel &model, const SavedForward &s)
             // ---- MHA backward ────────────────────────────────────
             Tensor dmha = dattn_out;
             if (sb.mha.used_dropout)
-                  dmha = backward_dropout(dmha, sb.mha.dropout_mask, DROPOUT);
+                  dmha = backward_dropout(dmha, sb.mha.dropout_mask, drop_p);
 
             // proj backward  [B,T,n_embd] → [B,T,n_head*hs]
             Tensor dconcat = backward_linear(dmha, sb.mha.concat,
@@ -812,7 +1163,7 @@ inline Grads backward(GPTLanguageModel &model, const SavedForward &s)
                   Tensor wei_used = sh.used_dropout ? Tensor([&]()
                                                              {
                                   Tensor tmp = sh.wei;
-                                  float inv_keep = 1.0f/(1.0f-DROPOUT);
+                                  float inv_keep = 1.0f/(1.0f-drop_p);
                                   for(int i=0;i<tmp.numel();++i)
                                       tmp.data[i] = sh.dropout_mask.data[i]*sh.wei.data[i]*inv_keep;
                                   return tmp; }())
@@ -841,7 +1192,7 @@ inline Grads backward(GPTLanguageModel &model, const SavedForward &s)
                   Tensor d_wei = d_wei_drop;
                   if (sh.used_dropout)
                   {
-                        float inv_keep = 1.0f / (1.0f - DROPOUT);
+                        float inv_keep = 1.0f / (1.0f - drop_p);
                         for (int i = 0; i < d_wei.numel(); ++i)
                               d_wei.data[i] *= sh.dropout_mask.data[i] * inv_keep;
                   }
@@ -935,39 +1286,210 @@ struct AdamWState
 {
       int step{0};
       float lr, beta1, beta2, eps;
+      bool use_adamw{true};
+      bool use_quantized_adam{false};
+      int quant_bits{0};
+      std::string name{"adamw"};
 
       struct ParamState
       {
-            std::vector<float> *param;
+            Tensor *param;
             std::vector<float> m, v;
+            std::vector<uint8_t> m4, v4;
+            std::vector<int8_t> m8, v8;
+            std::vector<int16_t> m16, v16;
+            float m_scale{1.0f};
+            float v_scale{1.0f};
+            int q_bits{0};
       };
       std::vector<ParamState> states;
 
-      AdamWState(float lr_ = 3e-4f, float b1 = 0.9f, float b2 = 0.999f, float e = 1e-8f)
-          : lr(lr_), beta1(b1), beta2(b2), eps(e) {}
-
-      void register_param(std::vector<float> &p)
+      AdamWState(float lr_ = 3e-4f, float b1 = 0.9f, float b2 = 0.999f,
+                 float e = 1e-8f, const std::string &optimizer_name = "adamw")
+          : lr(lr_), beta1(b1), beta2(b2), eps(e)
       {
-            states.push_back({&p,
-                              std::vector<float>(p.size(), 0.0f),
-                              std::vector<float>(p.size(), 0.0f)});
+            if (optimizer_name == "sgd")
+                  name = "sgd";
+            else if (optimizer_name == "adamw4")
+                  name = "adamw4";
+            else if (optimizer_name == "adamw8")
+                  name = "adamw8";
+            else if (optimizer_name == "adamw16")
+                  name = "adamw16";
+            else
+                  name = "adamw";
+            use_adamw = name == "adamw";
+            if (name == "adamw4") quant_bits = 4;
+            if (name == "adamw8") quant_bits = 8;
+            if (name == "adamw16") quant_bits = 16;
+            use_quantized_adam = quant_bits != 0;
+      }
+
+      void register_param(Tensor &p)
+      {
+            ParamState ps;
+            ps.param = &p;
+            size_t n = (size_t)p.numel();
+            if (use_adamw)
+            {
+                  ps.m.assign(n, 0.0f);
+                  ps.v.assign(n, 0.0f);
+            }
+            else if (use_quantized_adam)
+            {
+                  ps.q_bits = quant_bits;
+                  if (quant_bits == 4)
+                  {
+                        size_t packed = (n + 1) / 2;
+                        ps.m4.assign(packed, 0);
+                        ps.v4.assign(packed, 0);
+                  }
+                  else if (quant_bits == 8)
+                  {
+                        ps.m8.assign(n, 0);
+                        ps.v8.assign(n, 0);
+                  }
+                  else
+                  {
+                        ps.m16.assign(n, 0);
+                        ps.v16.assign(n, 0);
+                  }
+            }
+            states.push_back(std::move(ps));
+      }
+
+      static int quant_max(int bits)
+      {
+            return bits == 4 ? 7 : (bits == 8 ? 127 : 32767);
+      }
+
+      static int clamp_quant(int q, int bits)
+      {
+            int qm = quant_max(bits);
+            if (q > qm) q = qm;
+            if (q < -qm) q = -qm;
+            return q;
+      }
+
+      static uint8_t encode_i4(int q)
+      {
+            q = clamp_quant(q, 4);
+            if (q < 0) q += 16;
+            return (uint8_t)(q & 0x0f);
+      }
+
+      static int decode_i4(uint8_t nibble)
+      {
+            int q = (int)(nibble & 0x0f);
+            return q >= 8 ? q - 16 : q;
+      }
+
+      static int get_q4(const std::vector<uint8_t> &src, size_t i)
+      {
+            uint8_t byte = src[i / 2];
+            return (i % 2 == 0) ? decode_i4(byte & 0x0f) : decode_i4((byte >> 4) & 0x0f);
+      }
+
+      static void set_q4(std::vector<uint8_t> &dst, size_t i, int q)
+      {
+            uint8_t enc = encode_i4(q);
+            uint8_t &byte = dst[i / 2];
+            if (i % 2 == 0)
+                  byte = (uint8_t)((byte & 0xf0) | enc);
+            else
+                  byte = (uint8_t)((byte & 0x0f) | (enc << 4));
+      }
+
+      static float dequant_value(const ParamState &ps,
+                                 bool first_moment,
+                                 size_t i)
+      {
+            float scale = first_moment ? ps.m_scale : ps.v_scale;
+            if (ps.q_bits == 4)
+                  return (float)get_q4(first_moment ? ps.m4 : ps.v4, i) * scale;
+            if (ps.q_bits == 8)
+                  return (float)(first_moment ? ps.m8[i] : ps.v8[i]) * scale;
+            return (float)(first_moment ? ps.m16[i] : ps.v16[i]) * scale;
+      }
+
+      static void requantize_values(const std::vector<float> &tmp,
+                                    ParamState &ps,
+                                    bool first_moment)
+      {
+            float max_abs = 0.0f;
+            for (float v : tmp)
+                  max_abs = std::max(max_abs, std::fabs(v));
+            float &scale = first_moment ? ps.m_scale : ps.v_scale;
+            scale = max_abs > 0.0f ? max_abs / (float)quant_max(ps.q_bits) : 1.0f;
+            for (size_t i = 0; i < tmp.size(); ++i)
+            {
+                  int q = scale > 0.0f ? (int)std::lrint(tmp[i] / scale) : 0;
+                  q = clamp_quant(q, ps.q_bits);
+                  if (ps.q_bits == 4)
+                        set_q4(first_moment ? ps.m4 : ps.v4, i, q);
+                  else if (ps.q_bits == 8)
+                        (first_moment ? ps.m8 : ps.v8)[i] = (int8_t)q;
+                  else
+                        (first_moment ? ps.m16 : ps.v16)[i] = (int16_t)q;
+            }
       }
 
       // Update one param tensor from its gradient tensor
       void update_one(int idx, const Tensor &grad)
       {
             auto &ps = states[idx];
-            for (int i = 0; i < (int)ps.param->size(); ++i)
+            std::vector<float> values = ps.param->quantized ? ps.param->to_float_vector() : ps.param->data;
+            for (int i = 0; i < (int)values.size(); ++i)
             {
                   float g = grad.data[i];
+                  if (!use_adamw)
+                  {
+                        values[i] -= lr * g;
+                        continue;
+                  }
                   ps.m[i] = beta1 * ps.m[i] + (1.0f - beta1) * g;
                   ps.v[i] = beta2 * ps.v[i] + (1.0f - beta2) * g * g;
                   float mh = ps.m[i] / (1.0f - std::pow(beta1, step));
                   float vh = ps.v[i] / (1.0f - std::pow(beta2, step));
-                  (*ps.param)[i] -= lr * mh / (std::sqrt(vh) + eps);
+                  values[i] -= lr * mh / (std::sqrt(vh) + eps);
             }
+            if (ps.param->quantized)
+                  ps.param->quantize_from_values(values, ps.param->quant_bits, ps.param->scale_layout);
+            else
+                  ps.param->data.swap(values);
       }
 };
+
+inline void update_one_quantized_adam(std::vector<float> &param,
+                                      const Tensor &grad,
+                                      AdamWState &opt,
+                                      AdamWState::ParamState &ps)
+{
+      std::vector<float> tmp_m(param.size());
+      std::vector<float> tmp_v(param.size());
+      float bc1 = 1.0f - std::pow(opt.beta1, opt.step);
+      float bc2 = 1.0f - std::pow(opt.beta2, opt.step);
+
+      for (int i = 0; i < (int)param.size(); ++i)
+      {
+            float gv = grad.data[i];
+            float mv = AdamWState::dequant_value(ps, true, (size_t)i);
+            float vv = AdamWState::dequant_value(ps, false, (size_t)i);
+            mv = opt.beta1 * mv + (1.0f - opt.beta1) * gv;
+            vv = opt.beta2 * vv + (1.0f - opt.beta2) * gv * gv;
+            tmp_m[i] = mv;
+            tmp_v[i] = vv;
+            float mh = mv / bc1;
+            float vh = vv / bc2;
+            // Low-bit second moments can quantize small variance to zero while
+            // the first moment remains nonzero. Keep Adam's denominator sane.
+            vh = std::max(vh, mh * mh);
+            param[i] -= opt.lr * mh / (std::sqrt(std::max(vh, 0.0f)) + opt.eps);
+      }
+
+      AdamWState::requantize_values(tmp_m, ps, true);
+      AdamWState::requantize_values(tmp_v, ps, false);
+}
 
 inline void apply_grads(GPTLanguageModel &model,
                         const Grads &g,
@@ -976,23 +1498,44 @@ inline void apply_grads(GPTLanguageModel &model,
       opt.step++;
       int pi = 0;
 
-      auto upd = [&](std::vector<float> &param, const Tensor &grad)
+      auto upd = [&](Tensor &param, const Tensor &grad)
       {
             auto &ps = opt.states[pi++];
             assert(ps.param == &param);
-            for (int i = 0; i < (int)param.size(); ++i)
+            assert(param.numel() == grad.numel());
+            if (opt.use_quantized_adam)
+            {
+                  std::vector<float> values = param.quantized ? param.to_float_vector() : param.data;
+                  update_one_quantized_adam(values, grad, opt, ps);
+                  if (param.quantized)
+                        param.quantize_from_values(values, param.quant_bits, param.scale_layout);
+                  else
+                        param.data.swap(values);
+                  return;
+            }
+            std::vector<float> values = param.quantized ? param.to_float_vector() : std::vector<float>();
+            std::vector<float> &target = param.quantized ? values : param.data;
+#pragma omp parallel for if(target.size() > 4096)
+            for (int i = 0; i < (int)target.size(); ++i)
             {
                   float gv = grad.data[i];
+                  if (!opt.use_adamw)
+                  {
+                        target[i] -= opt.lr * gv;
+                        continue;
+                  }
                   ps.m[i] = opt.beta1 * ps.m[i] + (1.0f - opt.beta1) * gv;
                   ps.v[i] = opt.beta2 * ps.v[i] + (1.0f - opt.beta2) * gv * gv;
                   float mh = ps.m[i] / (1.0f - std::pow(opt.beta1, opt.step));
                   float vh = ps.v[i] / (1.0f - std::pow(opt.beta2, opt.step));
-                  param[i] -= opt.lr * mh / (std::sqrt(vh) + opt.eps);
+                  target[i] -= opt.lr * mh / (std::sqrt(vh) + opt.eps);
             }
+            if (param.quantized)
+                  param.quantize_from_values(values, param.quant_bits, param.scale_layout);
       };
 
-      upd(model.token_emb.weight.data, g.tok_emb.dW);
-      upd(model.pos_emb.weight.data, g.pos_emb.dW);
+      upd(model.token_emb.weight, g.tok_emb.dW);
+      upd(model.pos_emb.weight, g.pos_emb.dW);
 
       for (int l = 0; l < model.n_layer; ++l)
       {
@@ -1000,55 +1543,105 @@ inline void apply_grads(GPTLanguageModel &model,
             auto &gb = g.blocks[l];
             for (int h = 0; h < model.n_head; ++h)
             {
-                  upd(blk.sa.heads[h].key.weight.data, gb.sa.heads[h].dkey.dW);
-                  upd(blk.sa.heads[h].query.weight.data, gb.sa.heads[h].dquery.dW);
-                  upd(blk.sa.heads[h].value.weight.data, gb.sa.heads[h].dvalue.dW);
+                  upd(blk.sa.heads[h].key.weight, gb.sa.heads[h].dkey.dW);
+                  upd(blk.sa.heads[h].query.weight, gb.sa.heads[h].dquery.dW);
+                  upd(blk.sa.heads[h].value.weight, gb.sa.heads[h].dvalue.dW);
             }
-            upd(blk.sa.proj.weight.data, gb.sa.proj.dW);
-            upd(blk.sa.proj.bias.data, gb.sa.proj.db);
-            upd(blk.ffwd.fc1.weight.data, gb.ffwd.dfc1.dW);
-            upd(blk.ffwd.fc1.bias.data, gb.ffwd.dfc1.db);
-            upd(blk.ffwd.fc2.weight.data, gb.ffwd.dfc2.dW);
-            upd(blk.ffwd.fc2.bias.data, gb.ffwd.dfc2.db);
-            upd(blk.ln1.gamma.data, gb.ln1.dgamma);
-            upd(blk.ln1.beta.data, gb.ln1.dbeta);
-            upd(blk.ln2.gamma.data, gb.ln2.dgamma);
-            upd(blk.ln2.beta.data, gb.ln2.dbeta);
+            upd(blk.sa.proj.weight, gb.sa.proj.dW);
+            upd(blk.sa.proj.bias, gb.sa.proj.db);
+            upd(blk.ffwd.fc1.weight, gb.ffwd.dfc1.dW);
+            upd(blk.ffwd.fc1.bias, gb.ffwd.dfc1.db);
+            upd(blk.ffwd.fc2.weight, gb.ffwd.dfc2.dW);
+            upd(blk.ffwd.fc2.bias, gb.ffwd.dfc2.db);
+            upd(blk.ln1.gamma, gb.ln1.dgamma);
+            upd(blk.ln1.beta, gb.ln1.dbeta);
+            upd(blk.ln2.gamma, gb.ln2.dgamma);
+            upd(blk.ln2.beta, gb.ln2.dbeta);
       }
-      upd(model.ln_f.gamma.data, g.ln_f.dgamma);
-      upd(model.ln_f.beta.data, g.ln_f.dbeta);
-      upd(model.lm_head.weight.data, g.lm_head.dW);
-      upd(model.lm_head.bias.data, g.lm_head.db);
+      upd(model.ln_f.gamma, g.ln_f.dgamma);
+      upd(model.ln_f.beta, g.ln_f.dbeta);
+      upd(model.lm_head.weight, g.lm_head.dW);
+      upd(model.lm_head.bias, g.lm_head.db);
 }
 
-// Build AdamWState from model params (call once before training)
-inline AdamWState build_optimizer(GPTLanguageModel &model, float lr)
+inline void quantize_tensor_inplace(Tensor &t, int bits)
 {
-      AdamWState opt(lr);
-      opt.register_param(model.token_emb.weight.data);
-      opt.register_param(model.pos_emb.weight.data);
+      if (bits <= 0 || t.data.empty()) return;
+      int qmax = bits == 4 ? 7 : (bits == 8 ? 127 : 32767);
+      float max_abs = 0.0f;
+      for (float v : t.data)
+            max_abs = std::max(max_abs, std::fabs(v));
+      if (max_abs <= 0.0f) return;
+      float scale = max_abs / (float)qmax;
+#pragma omp parallel for if(t.data.size() > 4096)
+      for (int i = 0; i < (int)t.data.size(); ++i)
+      {
+            int q = (int)std::lrint(t.data[i] / scale);
+            if (q > qmax) q = qmax;
+            if (q < -qmax) q = -qmax;
+            t.data[i] = (float)q * scale;
+      }
+}
+
+inline void quantize_model_weights_inplace(GPTLanguageModel &model, int bits)
+{
+      if (bits != 4 && bits != 8 && bits != 16) return;
+      quantize_tensor_inplace(model.token_emb.weight, bits);
+      quantize_tensor_inplace(model.pos_emb.weight, bits);
       for (auto &blk : model.blocks)
       {
             for (auto &h : blk.sa.heads)
             {
-                  opt.register_param(h.key.weight.data);
-                  opt.register_param(h.query.weight.data);
-                  opt.register_param(h.value.weight.data);
+                  quantize_tensor_inplace(h.key.weight, bits);
+                  quantize_tensor_inplace(h.query.weight, bits);
+                  quantize_tensor_inplace(h.value.weight, bits);
             }
-            opt.register_param(blk.sa.proj.weight.data);
-            opt.register_param(blk.sa.proj.bias.data);
-            opt.register_param(blk.ffwd.fc1.weight.data);
-            opt.register_param(blk.ffwd.fc1.bias.data);
-            opt.register_param(blk.ffwd.fc2.weight.data);
-            opt.register_param(blk.ffwd.fc2.bias.data);
-            opt.register_param(blk.ln1.gamma.data);
-            opt.register_param(blk.ln1.beta.data);
-            opt.register_param(blk.ln2.gamma.data);
-            opt.register_param(blk.ln2.beta.data);
+            quantize_tensor_inplace(blk.sa.proj.weight, bits);
+            quantize_tensor_inplace(blk.sa.proj.bias, bits);
+            quantize_tensor_inplace(blk.ffwd.fc1.weight, bits);
+            quantize_tensor_inplace(blk.ffwd.fc1.bias, bits);
+            quantize_tensor_inplace(blk.ffwd.fc2.weight, bits);
+            quantize_tensor_inplace(blk.ffwd.fc2.bias, bits);
+            quantize_tensor_inplace(blk.ln1.gamma, bits);
+            quantize_tensor_inplace(blk.ln1.beta, bits);
+            quantize_tensor_inplace(blk.ln2.gamma, bits);
+            quantize_tensor_inplace(blk.ln2.beta, bits);
       }
-      opt.register_param(model.ln_f.gamma.data);
-      opt.register_param(model.ln_f.beta.data);
-      opt.register_param(model.lm_head.weight.data);
-      opt.register_param(model.lm_head.bias.data);
+      quantize_tensor_inplace(model.ln_f.gamma, bits);
+      quantize_tensor_inplace(model.ln_f.beta, bits);
+      quantize_tensor_inplace(model.lm_head.weight, bits);
+      quantize_tensor_inplace(model.lm_head.bias, bits);
+}
+
+// Build AdamWState from model params (call once before training)
+inline AdamWState build_optimizer(GPTLanguageModel &model, float lr,
+                                  const std::string &optimizer_name = "adamw")
+{
+      AdamWState opt(lr, 0.9f, 0.999f, 1e-8f, optimizer_name);
+      opt.register_param(model.token_emb.weight);
+      opt.register_param(model.pos_emb.weight);
+      for (auto &blk : model.blocks)
+      {
+            for (auto &h : blk.sa.heads)
+            {
+                  opt.register_param(h.key.weight);
+                  opt.register_param(h.query.weight);
+                  opt.register_param(h.value.weight);
+            }
+            opt.register_param(blk.sa.proj.weight);
+            opt.register_param(blk.sa.proj.bias);
+            opt.register_param(blk.ffwd.fc1.weight);
+            opt.register_param(blk.ffwd.fc1.bias);
+            opt.register_param(blk.ffwd.fc2.weight);
+            opt.register_param(blk.ffwd.fc2.bias);
+            opt.register_param(blk.ln1.gamma);
+            opt.register_param(blk.ln1.beta);
+            opt.register_param(blk.ln2.gamma);
+            opt.register_param(blk.ln2.beta);
+      }
+      opt.register_param(model.ln_f.gamma);
+      opt.register_param(model.ln_f.beta);
+      opt.register_param(model.lm_head.weight);
+      opt.register_param(model.lm_head.bias);
       return opt;
 }

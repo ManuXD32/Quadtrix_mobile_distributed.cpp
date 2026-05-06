@@ -9,3 +9,28 @@ frontend/dist/
 .venv
 build
 CMakeCache.txt
+
+# Native trainer build outputs / Salidas de build del entrenador nativo
+/quadtrix
+/quadtrix.exe
+/best_model.bin
+
+# Training artifacts / Artefactos de entrenamiento
+/models/
+*.gguf
+
+# Runtime caches and worker copies / Caches runtime y copias de workers
+/worker_datasets/
+/token_cache/
+/token_cache_*/
+
+# WebUI local runtime state / Estado runtime local de WebUI
+/profiles/*
+!/profiles/.gitkeep
+
+# Large local datasets used for smoke/perf tests / Datasets locales grandes de pruebas
+/data/general_knowledge_100mb*.txt
+
+# Local backup/scratch files / Backups y scratch locales
+/main.cpp-BACKUP
+/h

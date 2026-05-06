@@ -28,18 +28,18 @@ struct LayerNorm
 
       int num_params() const { return gamma.numel() + beta.numel(); }
 
-      void save(std::ofstream &f) const
+      void save(std::ostream &f, bool v2 = false) const
       {
-            f.write(reinterpret_cast<const char *>(gamma.data.data()),
-                    gamma.numel() * sizeof(float));
-            f.write(reinterpret_cast<const char *>(beta.data.data()),
-                    beta.numel() * sizeof(float));
+            if (v2) gamma.save_v2(f);
+            else gamma.save_raw_float(f);
+            if (v2) beta.save_v2(f);
+            else beta.save_raw_float(f);
       }
-      void load(std::ifstream &f)
+      void load(std::istream &f, bool v2 = false)
       {
-            f.read(reinterpret_cast<char *>(gamma.data.data()),
-                   gamma.numel() * sizeof(float));
-            f.read(reinterpret_cast<char *>(beta.data.data()),
-                   beta.numel() * sizeof(float));
+            if (v2) gamma.load_v2(f);
+            else gamma.load_raw_float(f);
+            if (v2) beta.load_v2(f);
+            else beta.load_raw_float(f);
       }
 };
